@@ -50,7 +50,7 @@ func NewGRPCWriter(addr string, tlsConfig *tls.Config, l *log.Logger) (*GRPCWrit
 		return nil, err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(context.Background()) //nolint:gosec // cancel is stored and called in Close()
 	w := &GRPCWriter{
 		msc:    colmetricspb.NewMetricsServiceClient(cc),
 		tsc:    coltracepb.NewTraceServiceClient(cc),
