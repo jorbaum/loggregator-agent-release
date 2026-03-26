@@ -156,54 +156,58 @@ func (p *Poller) poll() {
 		}
 	}
 
-	filteredBindings := checkBindings(
-		bindings,
-		&p.appLogStream,
-		p.checker,
-		p.logger,
-		p.failedHostsCache,
-		p.blacklistedDrains,
-		p.invalidDrains,
-		p.warn,
-	)
+	bc := &bindingChecker{
+		logStream:        &p.appLogStream,
+		logger:           p.logger,
+		checker:          p.checker,
+		failedHostsCache: p.failedHostsCache,
+		warn:             p.warn,
+	}
+	filteredBindings := bc.checkBindings(bindings)
+	p.blacklistedDrains.Set(bc.blacklistedDrains)
+	p.invalidDrains.Set(bc.invalidDrains)
 
 	bindingCount := CalculateBindingCount(filteredBindings)
 	p.lastBindingCount.Set(float64(bindingCount))
 	p.store.Set(filteredBindings, bindingCount)
 }
 
-func checkBindings(
-	bindings []Binding,
-	logStream *applog.AppLogStream,
-	checker IPChecker,
-	logger *log.Logger,
-	failedHostsCache *simplecache.SimpleCache[string, bool],
-	blacklistedDrainsGauge metrics.Gauge,
-	invalidDrainsGauge metrics.Gauge,
-	warn bool,
-) []Binding {
-	logger.Printf("checking bindings - found %d bindings", len(bindings))
-	var invalidDrains float64 = 0
-	var blacklistedDrains float64 = 0
+// bindingChecker is responsible for validating bindings and keeping track of invalid and blacklisted drain counts. It also sends warning logs when bindings are rejected.
+type bindingChecker struct {
+	logStream         *applog.AppLogStream
+	logger            *log.Logger
+	checker           IPChecker
+	failedHostsCache  *simplecache.SimpleCache[string, bool]
+	warn              bool
+	invalidDrains     float64
+	blacklistedDrains float64
+}
+
+// rejectBinding increments the appropriate drain counters and sends a warning log if necessary
+func (bc *bindingChecker) rejectBinding(creds []Credentials, msg string, invalid, blacklisted bool) {
+	if invalid {
+		bc.invalidDrains++
+	}
+	if blacklisted {
+		bc.blacklistedDrains++
+	}
+	if bc.warn {
+		warnApps(msg, creds, bc.logStream, bc.logger)
+	}
+}
+
+// checkBindings checks the bindings and returns a filtered list of valid bindings. It also updates the invalid and blacklisted drain counts.
+func (bc *bindingChecker) checkBindings(bindings []Binding) []Binding {
+	bc.logger.Printf("checking bindings - found %d bindings", len(bindings))
 	var filteredBindings []Binding
 	for _, b := range bindings {
 		if len(b.Credentials) == 0 {
-			logger.Printf("no credentials for %s", b.Url)
+			bc.logger.Printf("no credentials for %s", b.Url)
 			continue
 		}
 		u, err := url.Parse(b.Url)
-
 		if err != nil {
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf("Cannot parse syslog drain url %s", b.Url),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("Cannot parse syslog drain url %s", b.Url), false, false)
 			continue
 		}
 
@@ -212,118 +216,42 @@ func checkBindings(
 		anonymousUrl.RawQuery = ""
 
 		if invalidScheme(u.Scheme) {
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf("Invalid Scheme for syslog drain url %s", anonymousUrl.String()),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("Invalid Scheme for syslog drain url %s", anonymousUrl.String()), false, false)
 			continue
 		}
 
 		if len(u.Host) == 0 {
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf("No hostname found in syslog drain url %s", anonymousUrl.String()),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("No hostname found in syslog drain url %s", anonymousUrl.String()), false, false)
 			continue
 		}
 
 		if invalidLogFilter(u) {
-			invalidDrains += 1
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf("include-log-source-types and exclude-log-source-types cannot be used at the same time in syslog drain url %s", anonymousUrl.String()),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("include-log-source-types and exclude-log-source-types cannot be used at the same time in syslog drain url %s", anonymousUrl.String()), true, false)
 			continue
 		}
 
 		sourceTypes := getUnknownSourceTypes(u.Query())
 		if sourceTypes != nil {
-			invalidDrains += 1
-			for _, cred := range b.Credentials {
-				sendAppLogMessage(
-					fmt.Sprintf("Unknown source types '%s' in source type filter in syslog drain url %s", strings.Join(sourceTypes, ", "), anonymousUrl.String()),
-					cred.Apps,
-					logStream,
-					logger,
-				)
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("Unknown source types '%s' in source type filter in syslog drain url %s", strings.Join(sourceTypes, ", "), anonymousUrl.String()), true, false)
 			continue
 		}
 
-		_, exists := failedHostsCache.Get(u.Host)
+		_, exists := bc.failedHostsCache.Get(u.Host)
 		if exists {
-			invalidDrains += 1
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf(
-							"Skipped resolve ip address for syslog drain with url %s due to prior failure",
-							anonymousUrl.String(),
-						),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("Skipped resolve ip address for syslog drain with url %s due to prior failure", anonymousUrl.String()), true, false)
 			continue
 		}
 
-		ip, err := checker.ResolveAddr(u.Host)
+		ip, err := bc.checker.ResolveAddr(u.Host)
 		if err != nil {
-			invalidDrains += 1
-			failedHostsCache.Set(u.Host, true)
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf(
-							"Cannot resolve ip address for syslog drain with url %s",
-							anonymousUrl.String(),
-						),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.failedHostsCache.Set(u.Host, true)
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("Cannot resolve ip address for syslog drain with url %s", anonymousUrl.String()), true, false)
 			continue
 		}
 
-		err = checker.CheckBlacklist(ip)
+		err = bc.checker.CheckBlacklist(ip)
 		if err != nil {
-			invalidDrains += 1
-			blacklistedDrains += 1
-			if warn {
-				for _, cred := range b.Credentials {
-					sendAppLogMessage(
-						fmt.Sprintf(
-							"Resolved ip address for syslog drain with url %s is blacklisted",
-							anonymousUrl.String(),
-						),
-						cred.Apps,
-						logStream,
-						logger,
-					)
-				}
-			}
+			bc.rejectBinding(b.Credentials, fmt.Sprintf("Resolved ip address for syslog drain with url %s is blacklisted", anonymousUrl.String()), true, true)
 			continue
 		}
 
@@ -332,14 +260,7 @@ func checkBindings(
 			if len(cred.Cert) > 0 && len(cred.Key) > 0 {
 				_, err := tls.X509KeyPair([]byte(cred.Cert), []byte(cred.Key))
 				if err != nil {
-					if warn {
-						sendAppLogMessage(
-							fmt.Sprintf("failed to load certificate for %s", anonymousUrl.String()),
-							cred.Apps,
-							logStream,
-							logger,
-						)
-					}
+					bc.rejectBinding([]Credentials{cred}, fmt.Sprintf("failed to load certificate for %s", anonymousUrl.String()), false, false)
 					continue
 				}
 			}
@@ -348,14 +269,7 @@ func checkBindings(
 				certPool := x509.NewCertPool()
 				ok := certPool.AppendCertsFromPEM([]byte(cred.CA))
 				if !ok {
-					if warn {
-						sendAppLogMessage(
-							fmt.Sprintf("failed to load root CA for %s", anonymousUrl.String()),
-							cred.Apps,
-							logStream,
-							logger,
-						)
-					}
+					bc.rejectBinding([]Credentials{cred}, fmt.Sprintf("failed to load root CA for %s", anonymousUrl.String()), false, false)
 					continue
 				}
 			}
@@ -370,9 +284,13 @@ func checkBindings(
 			})
 		}
 	}
-	blacklistedDrainsGauge.Set(blacklistedDrains)
-	invalidDrainsGauge.Set(invalidDrains)
 	return filteredBindings
+}
+
+func warnApps(msg string, credentials []Credentials, logStream *applog.AppLogStream, logger *log.Logger) {
+	for _, cred := range credentials {
+		sendAppLogMessage(msg, cred.Apps, logStream, logger)
+	}
 }
 
 func sendAppLogMessage(msg string, apps []App, logStream *applog.AppLogStream, logger *log.Logger) {
